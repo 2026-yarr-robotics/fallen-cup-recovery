@@ -160,6 +160,10 @@ class FallenCupPoseNode(Node):
         self.declare_parameter("min_mask_area", 300.0)
         self.declare_parameter("min_pair_distance_px", 20.0)
         self.declare_parameter("max_pair_distance_px", 10000.0)
+        # two_face pair 가 "한 컵의 narrow/wide 두 face" 인지 판단하는 직경 비 임계값.
+        # narrow≈4.5cm vs wide≈7cm 인 컵이면 비≈1.5. 별개 두 컵끼리는 비≈1.0 이라
+        # 1.3 정도로 자르면 cross-cup pairing 을 막을 수 있다.
+        self.declare_parameter("min_pair_diameter_ratio", 1.3)
 
         self.weights_path = str(self.get_parameter("weights_path").value)
         self.image_topic = str(self.get_parameter("image_topic").value)
@@ -191,6 +195,9 @@ class FallenCupPoseNode(Node):
         self.min_mask_area = float(self.get_parameter("min_mask_area").value)
         self.min_pair_distance_px = float(self.get_parameter("min_pair_distance_px").value)
         self.max_pair_distance_px = float(self.get_parameter("max_pair_distance_px").value)
+        self.min_pair_diameter_ratio = float(
+            self.get_parameter("min_pair_diameter_ratio").value
+        )
 
         if self.weights_path == "":
             raise RuntimeError("weights_path is empty.")
@@ -457,6 +464,11 @@ class FallenCupPoseNode(Node):
         da = max(a["diameter"], 1.0)
         db = max(b["diameter"], 1.0)
         ratio = max(da, db) / min(da, db)
+
+        # 한 컵의 두 face 는 narrow/wide 비가 분명히 다르고(≥~1.5), 별개 두 컵
+        # 끼리는 비≈1.0. 비슷한 크기 mask 쌍은 cross-cup pairing 이라고 보고 거부.
+        if ratio < self.min_pair_diameter_ratio:
+            return None
 
         # 크기 차이가 있고, 중심 간 거리가 긴 pair를 선호
         return ratio * dist * 0.5 * (a["conf"] + b["conf"])

@@ -80,6 +80,15 @@ def generate_launch_description():
             default_value="0.045",
             description="real diameter of smaller top face in meters",
         ),
+        DeclareLaunchArgument(
+            "min_pair_diameter_ratio",
+            default_value="1.3",
+            description=(
+                "two_face pair 의 narrow/wide 직경 비 최소값. "
+                "한 컵의 두 face 는 ≥~1.5, 별개 두 컵은 ≈1.0 이라 이 값으로 "
+                "cross-cup pairing 을 차단한다. 너무 키우면 valid 한 two_face 도 거부됨."
+            ),
+        ),
 
         Node(
             package="speed_stack_yolo_seg",
@@ -113,6 +122,7 @@ def generate_launch_description():
                 "min_mask_area": 300.0,
                 "min_pair_distance_px": 20.0,
                 "max_pair_distance_px": 10000.0,
+                "min_pair_diameter_ratio": LaunchConfiguration("min_pair_diameter_ratio"),
             }],
         ),
     ])
