@@ -44,7 +44,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "device",
-            default_value="cpu",
+            default_value="cuda",
         ),
         DeclareLaunchArgument(
             "half",
