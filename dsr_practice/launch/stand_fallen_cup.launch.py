@@ -207,20 +207,20 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "robot_namespace",
-                default_value="dsr01",
+                default_value="",
                 description="bringup이 네임스페이스(예: dsr01) 아래에서 도는 경우 "
                             "MoveItPy 내부 노드들을 같은 네임스페이스로 옮기기 위한 값. "
-                            "bringup_real_31.sh(dsr_bringup2, name=dsr01)와 정합되도록 "
-                            "기본 'dsr01'. 루트 네임스페이스 bringup이면 :=\"\" 로 비운다.",
+                            "dsr_bringup2_moveit.launch.py는 name 기본값이 ''(루트)이므로 "
+                            "기본 ''(루트). namespaced bringup(name:=dsr01)이면 :=dsr01 로 준다.",
             ),
             DeclareLaunchArgument(
                 "joint_state_topic",
-                default_value="/dsr01/joint_states",
+                default_value="/joint_states",
                 description="MoveItPy planning scene monitor가 구독할 joint state "
                             "토픽. moveit_py.yaml의 절대 토픽 '/joint_states'는 "
                             "name_space remap으로 바뀌지 않으므로 직접 override 한다. "
-                            "네임스페이스 bringup이면 /<ns>/joint_states (기본 "
-                            "/dsr01/joint_states). 루트 bringup이면 :=/joint_states.",
+                            "dsr_bringup2_moveit(name 기본 '')는 /joint_states(루트)이므로 "
+                            "기본 /joint_states. 네임스페이스 bringup이면 :=/<ns>/joint_states.",
             ),
             Node(
                 package="dsr_practice",

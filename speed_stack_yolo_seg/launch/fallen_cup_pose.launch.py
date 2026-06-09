@@ -11,7 +11,9 @@ import os
 
 def generate_launch_description():
     pkg_share = get_package_share_directory("speed_stack_yolo_seg")
-    default_weights = os.path.join(pkg_share, "weights", "best.pt")
+    default_weights = os.path.join(
+        pkg_share, "weights", "speedstack3class_yolo26s_seg_1280.pt"
+    )
 
     return LaunchDescription([
         DeclareLaunchArgument(

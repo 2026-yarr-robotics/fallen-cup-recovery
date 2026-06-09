@@ -49,13 +49,17 @@ GROUP_NAME = "manipulator"
 BASE_FRAME = "base_link"
 EE_LINK    = "link_6"
 
+# 고정 원점(HOME) 자세. 2026-06-09 사용자가 실로봇으로 직접 만든 자세를
+# /joint_states 에서 캡처한 라디안 원값. (참고 도: j1 -2.84, j2 -14.92,
+# j3 88.48, j4 -2.96, j5 107.60, j6 86.61). fallen-cup / mouth-up-cup 두
+# task 모두 이 값을 공유(place_mouth_up_cup 가 import).
 HOME_JOINTS = {
-    "joint_1": math.radians(0.0),
-    "joint_2": math.radians(0.0),
-    "joint_3": math.radians(90.0),
-    "joint_4": math.radians(0.0),
-    "joint_5": math.radians(90.0),
-    "joint_6": math.radians(90.0),
+    "joint_1": -0.049552422016859055,
+    "joint_2": -0.26035377383232117,
+    "joint_3": 1.5442062616348267,
+    "joint_4": -0.05165897682309151,
+    "joint_5": 1.8779057264328003,
+    "joint_6": 1.5116537809371948,
 }
 
 # 안전 작업 영역 (m, base_link 기준) — click_pick_two와 동일
@@ -308,8 +312,9 @@ class StandFallenCupNode(Node):
         # use_current_as_home: true면 launch 시점의 robot 상태를 세션 HOME으로 저장.
         #   티치펜던트에서 설정한 HOME 위치를 코드 수정 없이 그대로 사용 가능.
         #   초기 HOME 이동을 스킵하고 종료 시 그 자세로 정확히 복귀.
-        # false면 코드에 박힌 HOME_JOINTS 사용 (기존 동작).
-        self.declare_parameter("use_current_as_home", True)
+        # false(기본)면 코드에 박힌 고정 원점 HOME_JOINTS 로 시작 시 이동 + 복귀.
+        #   2026-06-09: 우연한 launch 자세가 아니라 항상 고정 원점에서 시작하도록 기본 false.
+        self.declare_parameter("use_current_as_home", False)
         # place 모드에서 flange가 PLACE의 어느 쪽으로 위치할지.
         # "right"  → flange가 PLACE의 -Y 쪽 (로봇이 오른쪽으로 눕음, +Y obstacle 회피)
         # "left"   → flange가 PLACE의 +Y 쪽 (왼쪽으로 눕음)
@@ -400,8 +405,9 @@ class StandFallenCupNode(Node):
         #   생성되게 한다. 그래야 (1) FollowJointTrajectory 액션 클라이언트가
         #   <ns>/dsr_moveit_controller 에 바인딩되고 (2) joint_states 구독이
         #   <ns>/joint_states 로 걸려 현재 관절을 읽는다. 빈 값이면 루트.
-        #   기본 'dsr01': bringup_real_31.sh(dsr_bringup2, name=dsr01)와 정합.
-        self.declare_parameter("robot_namespace", "dsr01")
+        #   기본 '': dsr_bringup2_moveit.launch.py 의 name 기본값이 ''(루트)와 정합.
+        #   namespaced bringup(name:=dsr01)이면 robot_namespace:=dsr01 로 준다.
+        self.declare_parameter("robot_namespace", "")
 
         self.dry_run = bool(self.get_parameter("dry_run").value)
         self.use_current_as_home = bool(
@@ -1822,15 +1828,21 @@ class StandFallenCupNode(Node):
             for jn, jv in self._session_home_joints.items():
                 log.info(f"  {jn} = {math.degrees(jv):+.2f}°")
         else:
-            log.info("[Init] HOME 이동 (코드 HOME_JOINTS 사용)")
+            log.info("[Init] HOME 이동 (코드 HOME_JOINTS, Pilz PTP)")
             home_state = RobotState(self.robot_model)
             home_state.joint_positions = HOME_JOINTS
             home_state.update()
+            # PTP(관절 단조 보간) 우선. OMPL(RRTConnect)은 무작위라 시작 자세가
+            # HOME 과 멀면 팔을 천장으로 쳐들었다 내려오는 경로를 만들 수 있다.
             if not plan_and_execute(self.robot, self.arm, log,
                                     state_goal=home_state,
-                                    params=self.ompl_params):
-                log.error("HOME 이동 실패 — 종료")
-                return
+                                    params=self.pilz_params):
+                log.warn("[Init] Pilz PTP HOME 실패 — OMPL 재시도")
+                if not plan_and_execute(self.robot, self.arm, log,
+                                        state_goal=home_state,
+                                        params=self.ompl_params):
+                    log.error("HOME 이동 실패 — 종료")
+                    return
             self._session_home_joints = dict(HOME_JOINTS)
 
         # 시작 시점의 link_6 pose를 저장 (종료 시 동일한 자세로 복귀했는지 검증용)
