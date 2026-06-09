@@ -126,7 +126,7 @@ class FallenCupPoseNode(Node):
         self.declare_parameter("imgsz", 640)
         self.declare_parameter("conf", 0.25)
         self.declare_parameter("iou", 0.45)
-        self.declare_parameter("device", "cpu")
+        self.declare_parameter("device", "cuda")  # GPU 명시 고정 (CUDA 불가 시 아래에서 cpu fallback)
         self.declare_parameter("half", False)
 
         # auto: mask가 2개 이상이면 top/bottom face 방식 시도, 아니면 silhouette PCA 방식

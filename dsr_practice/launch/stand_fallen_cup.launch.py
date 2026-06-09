@@ -20,7 +20,9 @@ def generate_launch_description():
         .joint_limits()
         .trajectory_execution()
         .planning_scene_monitor()
-        .sensors_3d()
+        # .sensors_3d() 제거: 3D 센서(sensors_3d.yaml = sensors:[]) 미구성이라
+        # octomap 모니터가 "No 3D sensor plugin(s)" ERROR 만 찍고 실제 octomap
+        # 충돌회피는 안 함. stand_fallen_cup 은 octomap 미사용 → 노이즈 로그 제거.
         .to_moveit_configs()
     )
 
@@ -56,6 +58,8 @@ def generate_launch_description():
     sim_cup_y = LaunchConfiguration("sim_cup_y")
     sim_cup_z = LaunchConfiguration("sim_cup_z")
     sim_cup_yaw_deg = LaunchConfiguration("sim_cup_yaw_deg")
+    robot_namespace = LaunchConfiguration("robot_namespace")
+    joint_state_topic = LaunchConfiguration("joint_state_topic")
 
     return LaunchDescription(
         [
@@ -201,6 +205,23 @@ def generate_launch_description():
                 default_value="0.0",
                 description="sim 모드 가상 컵 yaw (deg)",
             ),
+            DeclareLaunchArgument(
+                "robot_namespace",
+                default_value="",
+                description="bringup이 네임스페이스(예: dsr01) 아래에서 도는 경우 "
+                            "MoveItPy 내부 노드들을 같은 네임스페이스로 옮기기 위한 값. "
+                            "dsr_bringup2_moveit.launch.py는 name 기본값이 ''(루트)이므로 "
+                            "기본 ''(루트). namespaced bringup(name:=dsr01)이면 :=dsr01 로 준다.",
+            ),
+            DeclareLaunchArgument(
+                "joint_state_topic",
+                default_value="/joint_states",
+                description="MoveItPy planning scene monitor가 구독할 joint state "
+                            "토픽. moveit_py.yaml의 절대 토픽 '/joint_states'는 "
+                            "name_space remap으로 바뀌지 않으므로 직접 override 한다. "
+                            "dsr_bringup2_moveit(name 기본 '')는 /joint_states(루트)이므로 "
+                            "기본 /joint_states. 네임스페이스 bringup이면 :=/<ns>/joint_states.",
+            ),
             Node(
                 package="dsr_practice",
                 executable="stand_fallen_cup",
@@ -265,6 +286,17 @@ def generate_launch_description():
                         "sim_cup_z": ParameterValue(sim_cup_z, value_type=float),
                         "sim_cup_yaw_deg": ParameterValue(
                             sim_cup_yaw_deg, value_type=float
+                        ),
+                        "robot_namespace": ParameterValue(
+                            robot_namespace, value_type=str
+                        ),
+                        # moveit_py.yaml의 절대경로 joint_state_topic을 override.
+                        # parameters 리스트에서 yaml(moveit_py_params)보다 뒤에
+                        # 오므로 우선 적용된다. 네임스페이스 bringup에서
+                        # planning_scene_monitor가 /<ns>/joint_states 를 구독해야
+                        # 현재 관절을 읽어 plan/IK 가 된다.
+                        "planning_scene_monitor_options.joint_state_topic": (
+                            ParameterValue(joint_state_topic, value_type=str)
                         ),
                     },
                 ],
