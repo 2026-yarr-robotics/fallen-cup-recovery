@@ -22,8 +22,11 @@ YOLO 인식 노드(fallen_cup_pose_node)가 publish하는
   - 위  좁은 부분 지름 ≈ 5.0 cm
 """
 
+import json
 import math
+import threading
 import time
+import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -32,8 +35,11 @@ from rclpy.node import Node
 
 from ament_index_python.packages import get_package_share_directory
 
-from geometry_msgs.msg import PoseStamped, PoseArray
-from std_msgs.msg import Float32MultiArray
+from geometry_msgs.msg import Pose, PoseStamped, PoseArray
+from std_msgs.msg import Float32MultiArray, String
+from shape_msgs.msg import SolidPrimitive
+from moveit_msgs.msg import CollisionObject, AttachedCollisionObject, PlanningScene
+from moveit_msgs.srv import ApplyPlanningScene
 from visualization_msgs.msg import Marker, MarkerArray
 
 from moveit.core.robot_state import RobotState
@@ -73,6 +79,15 @@ SAFE_Z_MIN =  0.05   # link_6 flange 기준 최저 안전 z
 #   flange_at_grip = bz - CUP_R_AT_GRIP + TOOL_LENGTH_M
 TOOL_LENGTH_M = 0.20     # link_6 flange → 그리퍼 손가락 closing 평면
                          # (RG2 + 툴체인저). click_pick_two의 Z_OFFSET와 동일 개념.
+
+# 그리퍼(RG2) 충돌 프록시 — planning 시 그리퍼가 차지하는 부피를 link_6 에
+# AttachedCollisionObject(BOX)로 붙여 그리퍼-장애물(피라미드) 충돌까지 회피.
+# link_6 좌표계 기준: +Z 가 플랜지 바깥(그리퍼 진행 방향). 박스는 (0,0,OFFZ) 중심.
+# 실로봇/sim 공통으로 항상 켜는 안전 기능(그리퍼는 양쪽 다 물리적으로 존재).
+GRIPPER_PROXY_SIZE  = (0.16, 0.10, 0.20)  # (x,y,z) m. x=손가락 벌어짐 폭, z=툴 길이
+GRIPPER_PROXY_OFFZ  = 0.10                # 박스 중심 z (= 길이/2, 플랜지에서 시작)
+GRIPPER_PROXY_TOUCH = ["link_6", "link_5", "link_4"]  # self-collision 무시 링크
+GRIPPER_PROXY_ID    = "gripper_proxy"
 CUP_R_AT_GRIP = 0.0225   # grip 지점 컵 반경. depth(컵 표면) → 컵 축 보정.
                          # grip이 narrow 끝에서 1.5cm 들어간 지점 → 반경 약 2.25cm
                          # (narrow 지름 4.5~5.0cm 가정, 살짝 안쪽이라 거의 동일).
@@ -94,14 +109,14 @@ HOME_PREREVERSE_MIN_Z = 0.25  # joint_1 pre-reverse(수평 호) 를 허용하는
                            # 먼저 수직 상승을 시도하고 그래도 낮으면 pre-reverse 를 스킵.
 
 # 컵 놓기 (drop / place 모드 공용)
-PLACE_X       = 0.55     # 컵을 세울 위치 (base frame, m).
-                         # ⚠ place 모드에서 그리퍼가 수평으로 향하므로 flange는
-                         # PLACE에서 TOOL_LENGTH(0.20m) 만큼 -EE_Z 방향에 위치한다.
-                         # 컵 방향(cup_dir_base)에 따라 EE_Z가 ±X 어느 쪽이든 향할 수
-                         # 있으므로, PLACE_X가 너무 작으면 worst case에 flange가
-                         # robot 베이스에 너무 가까워져 IK 실패.
-                         # 안전 마진: PLACE_X >= 0.50 권장.
-PLACE_Y       = 0.0      # 픽업 위치와 겹치지 않게. 정면이 가장 reach 여유 큼.
+PLACE_X       = 0.30     # 컵을 세울 위치 (base frame, m).
+                         # 넘어진-컵 작업영역(+Y, base 가까움) 안에 세워서 피라미드
+                         # 정면(0.45,0)을 피한다. 그리퍼는 수평이라 flange가 PLACE에서
+                         # TOOL_LENGTH(0.20m) 만큼 -EE_Z 방향(여기선 ±Y)으로 offset 됨 →
+                         # flange_y 가 SAFE_Y_MAX(0.30) 안에 들도록 PLACE_Y/접근측을 잡는다.
+PLACE_Y       = 0.10     # +Y 작업영역. 피라미드(y≈±0.12)서 멀고 base 가까움.
+                         # 0.10 검증값: +Y swing 시 flange_y=+0.281(SAFE_Y_MAX 0.30 내),
+                         # -Y 대칭 swing 시 flange_y=-0.081 → 양 케이스 place+retreat 성공.
 TABLE_Z       = 0.05     # 테이블 표면 z (base frame, m). 실측으로 조정.
 CUP_HEIGHT    = 0.10     # 컵 높이 (m). 실측으로 조정.
 DROP_HOLD_SEC = 3.0      # drop 모드에서 lift 후 release까지 대기 시간 (s)
@@ -125,6 +140,41 @@ PRE_TWIST_THRESHOLD_DEG = 90.0
 #   0.87 = cup_yaw ∈ [+60°, +120°] (엄격, 거의 ±Y 만)
 # 기본 0.50: 살짝 sideways 도 +Y로 간주.
 PLUS_Y_DETECT_SIN_THRESHOLD = 0.50
+
+# ─────────────────────────────────────────────────────────
+#  Pyramid obstacle geometry (MoveIt 충돌 회피용)
+# ─────────────────────────────────────────────────────────
+# 쌓인 피라미드를 MoveIt collision object 로 등록해 recovery 궤적이 피하게 한다.
+# 기하는 vision verifier_node (2026-yarr-robotics/vision-node, cup_stacking_verify)
+# 와 FastAPI RobotDomain pyramid 배치를 그대로 미러링한다:
+#   PYRAMID_CUP_SPACING=0.078 (슬롯 가로 간격=박스 폭, 행 방향)
+#   PYRAMID_LAYER_HEIGHT=0.093 (층 수직 피치)
+#   레이아웃 [3,2,1] (L1=3, L2=2, L3=1, 총 6슬롯)
+# center{x,y}+degree 는 GET /api/robot/config/pyramid 에서 런타임으로 받아온다
+# (verifier 와 동일 소스). z 는 TABLE_Z 에 앵커해 바닥부터 보수적으로 세운다.
+PYRAMID_CUP_SPACING = 0.078   # 슬롯 가로 간격(행 방향) = 박스 X 폭
+PYRAMID_CUP_DEPTH   = 0.070   # 박스 Y 깊이 (행 수직)
+PYRAMID_CUP_BOX_H   = 0.086   # 컵 한 개 박스 높이
+PYRAMID_LAYER_PITCH = 0.093   # 층 수직 피치 (cup_h 0.086 + gap 0.007)
+PYRAMID_LAYER_COUNTS = (3, 2, 1)
+_PYRAMID_SUFFIX_BY_COUNT = {1: ("T",), 2: ("L", "R"), 3: ("L", "M", "R")}
+
+
+def _build_pyramid_slot_map():
+    """슬롯 키(L1_L..L3_T) → (layer_idx, pos_idx, layer_count). verifier 명명과 일치."""
+    m = {}
+    for layer, count in enumerate(PYRAMID_LAYER_COUNTS):
+        for pos in range(count):
+            suffix = _PYRAMID_SUFFIX_BY_COUNT[count][pos]
+            m[f"L{layer + 1}_{suffix}"] = (layer, pos, count)
+    return m
+
+
+PYRAMID_SLOT_MAP = _build_pyramid_slot_map()
+
+PYRAMID_CONFIG_URL_DEFAULT = (
+    "https://yarr-api-31.simplyimg.com/api/robot/config/pyramid"
+)
 
 # 그리퍼 (raw 단위: 1/10 mm)
 GRIPPER_NAME     = "rg2"
@@ -379,6 +429,10 @@ class StandFallenCupNode(Node):
         self.declare_parameter("place_plus_y_side", "left")
         self.declare_parameter("place_plus_y_base_yaw_deg", 60.0)
         self.declare_parameter("place_plus_y_cup_tilt_deg", 25.0)
+        # place_x / place_y: single-cup PLACE 좌표 override (기본=모듈 상수 PLACE_X/Y).
+        #   리빌드 없이 작업영역 안에서 세울 위치를 튜닝하기 위함 (NaN 이면 상수 사용).
+        self.declare_parameter("place_x", float("nan"))
+        self.declare_parameter("place_y", float("nan"))
         # multi_cup:
         #   true 면 한 프레임에 여러 넘어진 cup 이 있어도 모두 순차 처리.
         #   /fallen_cup/cups_pose2d, /fallen_cup/cups_grasp_poses (Phase 1) 토픽 사용.
@@ -392,8 +446,8 @@ class StandFallenCupNode(Node):
         self.declare_parameter("multi_cup_min_samples_per_cluster", 3)
         # sim: 카메라/그리퍼 하드웨어 없이 MoveIt virtual에서 동작 시각화
         self.declare_parameter("sim", False)
-        self.declare_parameter("sim_cup_x", 0.40)
-        self.declare_parameter("sim_cup_y", 0.00)
+        self.declare_parameter("sim_cup_x", 0.28)   # 넘어진-컵 작업영역(피라미드 정면 0.45,0 에서 옆·뒤로 빠짐)
+        self.declare_parameter("sim_cup_y", 0.20)
         self.declare_parameter("sim_cup_z", 0.10)
         self.declare_parameter("sim_cup_yaw_deg", 0.0)
         # robot_namespace:
@@ -408,6 +462,23 @@ class StandFallenCupNode(Node):
         #   기본 '': dsr_bringup2_moveit.launch.py 의 name 기본값이 ''(루트)와 정합.
         #   namespaced bringup(name:=dsr01)이면 robot_namespace:=dsr01 로 준다.
         self.declare_parameter("robot_namespace", "")
+
+        # ── 피라미드 장애물 회피 ──────────────────────────────────────────
+        # True 면 쌓인 피라미드(/stack 점유 슬롯)를 MoveIt collision object 로
+        # 등록해 recovery 궤적이 회피. center/degree 는 API polling 으로 동기화.
+        # vision 스택/서버가 없으면 graceful no-op (장애물 0개, 동작 변화 없음).
+        self.declare_parameter("pyramid_avoid", True)
+        self.declare_parameter("pyramid_config_url", PYRAMID_CONFIG_URL_DEFAULT)
+        self.declare_parameter("pyramid_stack_topic", "/stack")
+        self.declare_parameter("pyramid_sync_poll_period_s", 5.0)
+        # 박스를 xy 로 인플레이션할 여유 (m). Pilz 는 회피 재계획을 안 하고
+        # OMPL 만 피하므로 약간의 margin 으로 안전 여유 확보.
+        self.declare_parameter("pyramid_obstacle_margin_m", 0.02)
+        # /stack 수집 대기 (s). vision 이 떠 있으면 sticky 라 즉시 도착.
+        self.declare_parameter("pyramid_stack_wait_s", 1.5)
+        # 그리퍼 충돌 프록시 attach 여부 (실로봇/sim 공통, 기본 ON).
+        # 끄면 planning 이 팔 링크만 보고 그리퍼 부피를 무시 → 피라미드 클립 위험.
+        self.declare_parameter("attach_gripper_collision", True)
 
         self.dry_run = bool(self.get_parameter("dry_run").value)
         self.use_current_as_home = bool(
@@ -488,6 +559,22 @@ class StandFallenCupNode(Node):
         self.robot_namespace = str(
             self.get_parameter("robot_namespace").value or ""
         ).strip()
+        self.pyramid_avoid = bool(self.get_parameter("pyramid_avoid").value)
+        self.pyramid_config_url = str(
+            self.get_parameter("pyramid_config_url").value or ""
+        ).strip()
+        self.pyramid_stack_topic = str(
+            self.get_parameter("pyramid_stack_topic").value or "/stack"
+        ).strip()
+        self.pyramid_sync_poll_period_s = max(
+            1.0, float(self.get_parameter("pyramid_sync_poll_period_s").value)
+        )
+        self.pyramid_obstacle_margin_m = float(
+            self.get_parameter("pyramid_obstacle_margin_m").value
+        )
+        self.pyramid_stack_wait_s = float(
+            self.get_parameter("pyramid_stack_wait_s").value
+        )
 
         log.info(f"=== POST-LIFT MODE: {self.mode} ===")
         if self.sim:
@@ -510,15 +597,14 @@ class StandFallenCupNode(Node):
         self.gripper2cam[:3, 3] /= 1000.0  # mm → m
         log.info(f"Hand-Eye 로드: {calib_file}")
 
-        # 그리퍼 (sim 모드면 HW 연결 실패해도 무시)
-        try:
+        # 그리퍼 (sim 모드면 HW를 아예 잡지 않는다 — RG()는 lazy connect라
+        # 생성자에서 안 터지므로, sim이면 구성 자체를 건너뛰어 _gripper_move가
+        # no-op이 되게 한다.)
+        if self.sim:
+            log.warn("[sim] gripper HW 우회 — 그리퍼 명령은 모두 skip 된다")
+            self.gripper = None
+        else:
             self.gripper = RG(GRIPPER_NAME, TOOLCHARGER_IP, TOOLCHARGER_PORT)
-        except Exception as e:
-            if self.sim:
-                log.warn(f"[sim] gripper HW 연결 안 됨 (정상): {e}")
-                self.gripper = None
-            else:
-                raise
 
         # MoveIt
         # MoveItPy는 rclcpp::init(...)로 자체 컨텍스트를 만들고 launch가 넘긴
@@ -573,9 +659,11 @@ class StandFallenCupNode(Node):
         self._cups_frame_samples = []       # list of frame dicts with cups list
 
         # 활성 PLACE 좌표 (in-place stand 위해 multi-cup loop 가 override).
-        # 기본값은 모듈 상수 — single-cup 동작 변경 없음.
-        self._active_place_x = PLACE_X
-        self._active_place_y = PLACE_Y
+        # 기본값은 모듈 상수 — single-cup 동작 변경 없음. place_x/y 파라미터로 override 가능.
+        _px = self.get_parameter("place_x").value
+        _py = self.get_parameter("place_y").value
+        self._active_place_x = PLACE_X if math.isnan(_px) else float(_px)
+        self._active_place_y = PLACE_Y if math.isnan(_py) else float(_py)
 
         self.create_subscription(
             PoseStamped, "/fallen_cup/grasp_pose",
@@ -590,6 +678,47 @@ class StandFallenCupNode(Node):
         self.create_subscription(
             PoseArray, "/fallen_cup/cups_grasp_poses",
             self._cups_grasp_poses_cb, 10)
+
+        # ── 피라미드 장애물 상태 + API polling ────────────────────────────
+        # center/degree 는 백그라운드 스레드가 API 를 polling 해 갱신(순수 데이터만
+        # 갱신, planning scene 변경은 메인 스레드에서만). /stack 점유는 구독으로 수신.
+        self._pyramid_center = None         # (x, y) | None  (API 동기화값)
+        self._pyramid_degree = None         # float  | None
+        self._pyramid_occupied = set()      # 점유 슬롯 키 집합 (/stack 최신)
+        self._pyramid_stack_seen = False    # /stack 메시지 수신 여부
+        self._pyramid_obstacle_ids = []     # 등록된 collision object id (정리용)
+        # move_group 의 표준 scene(/collision_object → /monitored_planning_scene)
+        # 에도 박스를 publish 해서 RViz MotionPlanning 에 보이게 한다. (노드 자체
+        # MoveItPy scene 은 moveit_py.yaml 의 별도 토픽이라 RViz 가 안 봄.)
+        self._pyramid_co_pub = None
+        if self.pyramid_avoid:
+            self._pyramid_co_pub = self.create_publisher(
+                CollisionObject, "/collision_object", 10)
+            self.create_subscription(
+                String, self.pyramid_stack_topic, self._stack_cb, 10)
+            if self.pyramid_config_url:
+                threading.Thread(
+                    target=self._pyramid_poll_loop, daemon=True).start()
+                log.info(
+                    f"[pyramid] avoid ON — /stack='{self.pyramid_stack_topic}', "
+                    f"config polling {self.pyramid_config_url} "
+                    f"every {self.pyramid_sync_poll_period_s:.0f}s")
+            else:
+                log.warn("[pyramid] config_url 비어있음 — center/degree 기본값 사용")
+        else:
+            log.info("[pyramid] avoid OFF — 장애물 등록 안 함")
+
+        # 그리퍼 충돌 프록시: 노드 MoveItPy scene 에 직접 attach + move_group
+        # 표준 scene 에도 /attached_collision_object 로 publish(RViz 수동 plan 용).
+        # move_group 은 attached_collision_object 토픽을 구독하지 않으므로(world
+        # geometry monitor 만), /apply_planning_scene 서비스로 diff 를 적용한다.
+        # 실로봇(move_group 없음)에선 서비스가 없어 graceful skip.
+        self.attach_gripper_collision = bool(
+            self.get_parameter("attach_gripper_collision").value)
+        self._apply_scene_cli = None
+        if self.attach_gripper_collision:
+            self._apply_scene_cli = self.create_client(
+                ApplyPlanningScene, "/apply_planning_scene")
 
         # sim 모드: 가상 컵 marker
         self.cup_marker_pub = None
@@ -1429,18 +1558,26 @@ class StandFallenCupNode(Node):
             self._cup_state = "attached"
             log.info(f"[sim] cup attached (axis_ee_sign={self._cup_axis_ee_sign:+d})")
 
-        # 7) LIFT — IK 현재 관절 seed로 잠금 (잡은 컵이 휘둘리지 않게)
-        lift_pose = make_pose(bx, by, LIFT_Z, ori)
-        lift_state = self.ik_state_with_current_seed(lift_pose)
-        if lift_state is None:
-            log.error("lift IK 실패 — 종료")
-            return False
-        log.info(f"[4] Lift @ z={LIFT_Z:.3f} (joint goal, orientation 잠금)")
-        if not plan_and_execute(
-                self.robot, self.arm, log,
-                state_goal=lift_state,
-                params=self.pilz_params):
-            return False
+        # 7) LIFT — Cartesian 수직 상승(XY 고정·orientation 잠금).
+        #    PTP joint-space 보간은 EE 가 곡선을 그리며 피라미드(L1_M/L2_R)로
+        #    swing → gripper_proxy 충돌로 plan 실패했음. LIN 수직은 XY 를 픽
+        #    위치에 고정해 그리퍼가 피라미드로 휘둘리지 않는다.
+        log.info(f"[4] Lift @ z={LIFT_Z:.3f} (Cartesian 수직, XY 고정·orientation 잠금)")
+        reached_z = self._lift_straight_up(LIFT_Z)
+        if reached_z < LIFT_Z - 0.03:
+            # LIN 으로 충분히 못 올라옴(특이점 등) → collision-aware OMPL 로 재시도.
+            log.warn(
+                f"[4] 수직 LIN 확보 높이 {reached_z:.3f}m < 목표 {LIFT_Z:.3f}m "
+                "→ OMPL(충돌회피)로 lift 재시도"
+            )
+            lift_pose = make_pose(bx, by, LIFT_Z, ori)
+            lift_state = self.ik_state_with_current_seed(lift_pose)
+            if lift_state is None or not plan_and_execute(
+                    self.robot, self.arm, log,
+                    state_goal=lift_state,
+                    params=self.ompl_params):
+                log.error("lift 실패 — 종료")
+                return False
 
         log.info(f"[Hold] {LIFT_HOLD_SEC}s 대기 (컵 매달림 안정화)")
         time.sleep(LIFT_HOLD_SEC)
@@ -1476,10 +1613,27 @@ class StandFallenCupNode(Node):
                     self.place_flange_side = self.place_plus_y_side
                     self.place_base_yaw_deg = self.place_plus_y_base_yaw_deg
                     self.place_cup_tilt_deg = self.place_plus_y_cup_tilt_deg
+                elif sin_cup < -PLUS_Y_DETECT_SIN_THRESHOLD:
+                    # cup wide 가 -Y 로 누운 대칭 케이스: 위 +Y swing 을 좌우 반전.
+                    #   side left↔right, base_yaw 부호 반전(+60→-60), tilt 동일.
+                    # joint_1 을 -Y 쪽으로 swing 시켜 elbow 가 피라미드를 쓸지 않게 한다
+                    #   (반전 없으면 default config 로 접근해 link_4/5 가 피라미드 통과).
+                    mirror_side = "right" if self.place_plus_y_side == "left" else "left"
+                    mirror_base_yaw = -self.place_plus_y_base_yaw_deg
+                    log.info(
+                        f"[plus-y-auto] cup_yaw={math.degrees(cup_yaw):+.1f}° "
+                        f"(sin={sin_cup:.3f}) < -thr={-PLUS_Y_DETECT_SIN_THRESHOLD} → "
+                        "-Y 대칭 swing 발동: "
+                        f"side={mirror_side}, base_yaw={mirror_base_yaw:+.1f}°, "
+                        f"tilt={self.place_plus_y_cup_tilt_deg:+.1f}°"
+                    )
+                    self.place_flange_side = mirror_side
+                    self.place_base_yaw_deg = mirror_base_yaw
+                    self.place_cup_tilt_deg = self.place_plus_y_cup_tilt_deg
                 else:
                     log.info(
                         f"[plus-y-auto] cup_yaw={math.degrees(cup_yaw):+.1f}° "
-                        f"(sin={sin_cup:.3f}) ≤ thr → swing 미발동, "
+                        f"(sin={sin_cup:.3f}) |·| ≤ thr → swing 미발동, "
                         "기본 파라미터 유지"
                     )
 
@@ -1808,6 +1962,220 @@ class StandFallenCupNode(Node):
         return True
 
     # ──────────────────────────────────────────
+    #  Pyramid 장애물 회피
+    # ──────────────────────────────────────────
+    def _stack_cb(self, msg: String):
+        """/stack (JSON {slot: color|null}) 수신 → 점유 슬롯 집합 갱신."""
+        try:
+            data = json.loads(msg.data)
+        except (ValueError, TypeError) as e:
+            self.get_logger().warn(
+                f"[pyramid] /stack JSON 파싱 실패: {e}", throttle_duration_sec=10.0)
+            return
+        if not isinstance(data, dict):
+            return
+        occupied = {
+            slot for slot, color in data.items()
+            if color is not None and slot in PYRAMID_SLOT_MAP
+        }
+        self._pyramid_occupied = occupied
+        self._pyramid_stack_seen = True
+
+    def _fetch_pyramid_config(self, timeout=3.0):
+        """GET /api/robot/config/pyramid → (center_x, center_y, degree) | None.
+        Cloudflare 가 기본 urllib UA 를 403 하므로 curl 류 UA 로 위장(verifier 동일)."""
+        url = self.pyramid_config_url
+        if not url:
+            return None
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "curl/7.81.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read())
+            return (float(data["center"]["x"]),
+                    float(data["center"]["y"]),
+                    float(data["degree"]))
+        except Exception as e:  # noqa: BLE001 — 도달불가/파싱오류 → None
+            self.get_logger().warn(
+                f"[pyramid] config fetch 실패: {e}", throttle_duration_sec=15.0)
+            return None
+
+    def _pyramid_poll_loop(self):
+        """백그라운드: API 를 polling 해 center/degree 를 최신으로 유지.
+        planning scene 은 건드리지 않는다(메인 스레드 전용). 값 변경 시에만 로그."""
+        last = None
+        while rclpy.ok():
+            cfg = self._fetch_pyramid_config()
+            if cfg is not None:
+                cx, cy, deg = cfg
+                self._pyramid_center = (cx, cy)
+                self._pyramid_degree = deg
+                key = (round(cx, 4), round(cy, 4), round(deg, 2))
+                if key != last:
+                    self.get_logger().info(
+                        f"[pyramid] config 동기화 center=({cx:.3f},{cy:.3f}) "
+                        f"degree={deg:.1f}")
+                    last = key
+            time.sleep(self.pyramid_sync_poll_period_s)
+
+    def _pyramid_slot_box(self, slot_key, center_xy, degree_deg, margin):
+        """점유 슬롯 → (id, [dx,dy,dz], (cx,cy,cz)) base_link AABB. verifier
+        get_virtual_box 와 동일 기하. z 는 TABLE_Z 에 앵커(바닥부터 보수적)."""
+        layer, pos, count = PYRAMID_SLOT_MAP[slot_key]
+        theta = math.radians(degree_deg)
+        ux, uy = math.cos(theta), math.sin(theta)
+        offset = (pos - (count - 1) / 2.0) * PYRAMID_CUP_SPACING
+        cx = center_xy[0] + offset * ux
+        cy = center_xy[1] + offset * uy
+        z_bottom = TABLE_Z + layer * PYRAMID_LAYER_PITCH
+        cz = z_bottom + PYRAMID_CUP_BOX_H / 2.0
+        dx = PYRAMID_CUP_SPACING + 2.0 * margin
+        dy = PYRAMID_CUP_DEPTH + 2.0 * margin
+        dz = PYRAMID_CUP_BOX_H
+        # 박스를 행 방향(degree)으로 회전 → 긴 축(dx=spacing)이 행을 따라간다.
+        return (f"pyramid_{slot_key}", [dx, dy, dz], (cx, cy, cz), theta)
+
+    def _build_gripper_aco(self):
+        """RG2 envelope BOX 를 link_6 에 붙이는 AttachedCollisionObject 생성."""
+        co = CollisionObject()
+        co.header.frame_id = EE_LINK          # link_6 좌표계로 부착
+        co.id = GRIPPER_PROXY_ID
+        prim = SolidPrimitive()
+        prim.type = SolidPrimitive.BOX
+        prim.dimensions = list(GRIPPER_PROXY_SIZE)
+        pose = Pose()
+        pose.position.z = GRIPPER_PROXY_OFFZ  # 플랜지 +Z 로 박스 중심 이동
+        pose.orientation.w = 1.0
+        co.primitives.append(prim)
+        co.primitive_poses.append(pose)
+        co.operation = CollisionObject.ADD
+        aco = AttachedCollisionObject()
+        aco.link_name = EE_LINK
+        aco.object = co
+        aco.touch_links = list(GRIPPER_PROXY_TOUCH)
+        return aco
+
+    def _attach_gripper_proxy(self):
+        """그리퍼 부피를 link_6 에 attach → 이후 모든 plan 이 그리퍼-장애물 충돌
+        까지 회피. 노드 MoveItPy scene(실제 plan) + move_group scene(RViz) 양쪽.
+        실로봇/sim 공통, 그리퍼는 항상 물리적으로 달려있으므로 기본 ON."""
+        log = self.get_logger()
+        if not self.attach_gripper_collision:
+            log.info("[gripper-co] attach OFF — planning 이 그리퍼 부피 무시")
+            return
+        aco = self._build_gripper_aco()
+        # 1) 노드 자체 MoveItPy scene (실제 recovery plan 이 보는 scene)
+        psm = self.robot.get_planning_scene_monitor()
+        with psm.read_write() as scene:
+            scene.process_attached_collision_object(aco)
+            scene.current_state.update()
+        # 2) move_group 표준 scene (RViz MotionPlanning 수동 plan 용) — 서비스 diff
+        self._apply_aco_to_move_group(aco)
+        s = GRIPPER_PROXY_SIZE
+        log.info(
+            f"[gripper-co] RG2 프록시 attach @ {EE_LINK} "
+            f"box=[{s[0]:.2f},{s[1]:.2f},{s[2]:.2f}]m offz={GRIPPER_PROXY_OFFZ:.2f} "
+            f"touch={GRIPPER_PROXY_TOUCH}")
+
+    def _apply_aco_to_move_group(self, aco):
+        """AttachedCollisionObject 를 외부 move_group scene 에 적용(RViz 시각화용).
+        move_group 미가동(실로봇)이면 서비스가 없어 조용히 skip."""
+        log = self.get_logger()
+        cli = self._apply_scene_cli
+        if cli is None:
+            return
+        if not cli.wait_for_service(timeout_sec=2.0):
+            log.warn("[gripper-co] /apply_planning_scene 없음 — move_group "
+                     "scene 갱신 skip (실로봇이면 정상, RViz 수동 plan 에만 영향)")
+            return
+        scene = PlanningScene()
+        scene.is_diff = True
+        scene.robot_state.is_diff = True
+        scene.robot_state.attached_collision_objects.append(aco)
+        req = ApplyPlanningScene.Request()
+        req.scene = scene
+        fut = cli.call_async(req)
+        rclpy.spin_until_future_complete(self, fut, timeout_sec=5.0)
+        ok = fut.result().success if fut.result() else False
+        log.info(f"[gripper-co] move_group scene apply: success={ok}")
+
+    def _register_pyramid_obstacles(self):
+        """쌓인 피라미드를 MoveIt collision object 로 등록. 메인 스레드에서 호출.
+        서버/토픽 미가용이면 graceful no-op (장애물 0개)."""
+        if not self.pyramid_avoid:
+            return
+        log = self.get_logger()
+
+        # 1) center/degree 확보: poll 스레드 값 우선, 없으면 1회 동기 fetch.
+        center = self._pyramid_center
+        degree = self._pyramid_degree
+        if center is None or degree is None:
+            cfg = self._fetch_pyramid_config()
+            if cfg is not None:
+                center = (cfg[0], cfg[1])
+                degree = cfg[2]
+        if center is None or degree is None:
+            log.warn(
+                "[pyramid] config 미확보(서버 미응답) — 장애물 등록 스킵 "
+                f"(기본값 무시, recovery 정상 진행)")
+            return
+
+        # 2) /stack 점유 수집: sticky 라 잠깐 spin 하면 즉시 도착.
+        t0 = time.time()
+        while (rclpy.ok() and not self._pyramid_stack_seen
+               and time.time() - t0 < self.pyramid_stack_wait_s):
+            rclpy.spin_once(self, timeout_sec=0.05)
+        if not self._pyramid_stack_seen:
+            log.warn(
+                f"[pyramid] '{self.pyramid_stack_topic}' 미수신 "
+                f"(vision 스택 미가동?) — 장애물 등록 스킵, recovery 정상 진행")
+            return
+
+        occupied = sorted(self._pyramid_occupied)
+        if not occupied:
+            log.info("[pyramid] 점유 슬롯 0개 — 빈 피라미드, 장애물 없음")
+            return
+
+        # 3) 점유 슬롯마다 collision object(BOX) 등록.
+        margin = self.pyramid_obstacle_margin_m
+        boxes = [self._pyramid_slot_box(s, center, degree, margin)
+                 for s in occupied]
+        psm = self.robot.get_planning_scene_monitor()
+        registered = []
+        with psm.read_write() as scene:
+            for obj_id, dims, (cx, cy, cz), yaw in boxes:
+                co = CollisionObject()
+                co.header.frame_id = BASE_FRAME
+                co.id = obj_id
+                prim = SolidPrimitive()
+                prim.type = SolidPrimitive.BOX
+                prim.dimensions = dims
+                pose = Pose()
+                pose.position.x = cx
+                pose.position.y = cy
+                pose.position.z = cz
+                pose.orientation.z = math.sin(yaw / 2.0)
+                pose.orientation.w = math.cos(yaw / 2.0)
+                co.primitives.append(prim)
+                co.primitive_poses.append(pose)
+                co.operation = CollisionObject.ADD
+                scene.apply_collision_object(co)
+                # RViz(move_group 표준 scene)에도 동일 박스 publish.
+                if self._pyramid_co_pub is not None:
+                    co.header.stamp = self.get_clock().now().to_msg()
+                    self._pyramid_co_pub.publish(co)
+                registered.append(obj_id)
+            scene.current_state.update()
+        self._pyramid_obstacle_ids = registered
+        log.info(
+            f"[pyramid] 장애물 {len(registered)}개 등록 "
+            f"(center=({center[0]:.3f},{center[1]:.3f}), degree={degree:.1f}, "
+            f"margin={margin*1000:.0f}mm): {', '.join(occupied)}")
+        for obj_id, dims, (cx, cy, cz), yaw in boxes:
+            log.info(
+                f"    {obj_id}: c=({cx:.3f},{cy:.3f},{cz:.3f}) "
+                f"box=[{dims[0]:.3f},{dims[1]:.3f},{dims[2]:.3f}] "
+                f"yaw={math.degrees(yaw):.0f}°")
 
     def run(self):
         log = self.get_logger()
@@ -1852,6 +2220,12 @@ class StandFallenCupNode(Node):
             f"[Init] HOME link_6 pose: "
             f"pos=({sp[0]:.3f},{sp[1]:.3f},{sp[2]:.3f})"
         )
+
+        # 1.4) 그리퍼 부피를 link_6 에 attach (이후 모든 plan 이 그리퍼-장애물 회피).
+        self._attach_gripper_proxy()
+
+        # 1.5) 쌓인 피라미드를 MoveIt 장애물로 등록 (이후 모든 plan 이 회피).
+        self._register_pyramid_obstacles()
 
         # 2) 그리퍼 열기
         self._gripper_move(GRIP_OPEN_WIDTH, GRIP_FORCE)
@@ -1917,9 +2291,11 @@ class StandFallenCupNode(Node):
                 return
             p_base, cup_yaw = target
 
-        # single-cup mode: 기본 PLACE 좌표 사용
-        self._active_place_x = PLACE_X
-        self._active_place_y = PLACE_Y
+        # single-cup mode: 기본 PLACE 좌표(또는 place_x/y override) 사용
+        _px = self.get_parameter("place_x").value
+        _py = self.get_parameter("place_y").value
+        self._active_place_x = PLACE_X if math.isnan(_px) else float(_px)
+        self._active_place_y = PLACE_Y if math.isnan(_py) else float(_py)
         if not self._pick_and_handle_cup(p_base, cup_yaw):
             return
 

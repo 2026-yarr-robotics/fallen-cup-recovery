@@ -46,6 +46,8 @@ def generate_launch_description():
     place_plus_y_side = LaunchConfiguration("place_plus_y_side")
     place_plus_y_base_yaw_deg = LaunchConfiguration("place_plus_y_base_yaw_deg")
     place_plus_y_cup_tilt_deg = LaunchConfiguration("place_plus_y_cup_tilt_deg")
+    place_x = LaunchConfiguration("place_x")
+    place_y = LaunchConfiguration("place_y")
     multi_cup = LaunchConfiguration("multi_cup")
     multi_cup_max_iterations = LaunchConfiguration("multi_cup_max_iterations")
     multi_cup_cluster_radius_m = LaunchConfiguration("multi_cup_cluster_radius_m")
@@ -60,6 +62,12 @@ def generate_launch_description():
     sim_cup_yaw_deg = LaunchConfiguration("sim_cup_yaw_deg")
     robot_namespace = LaunchConfiguration("robot_namespace")
     joint_state_topic = LaunchConfiguration("joint_state_topic")
+    pyramid_avoid = LaunchConfiguration("pyramid_avoid")
+    pyramid_config_url = LaunchConfiguration("pyramid_config_url")
+    pyramid_stack_topic = LaunchConfiguration("pyramid_stack_topic")
+    pyramid_sync_poll_period_s = LaunchConfiguration("pyramid_sync_poll_period_s")
+    pyramid_obstacle_margin_m = LaunchConfiguration("pyramid_obstacle_margin_m")
+    pyramid_stack_wait_s = LaunchConfiguration("pyramid_stack_wait_s")
 
     return LaunchDescription(
         [
@@ -153,6 +161,18 @@ def generate_launch_description():
                             "기본 25 (사용자 검증값).",
             ),
             DeclareLaunchArgument(
+                "place_x",
+                default_value="nan",
+                description="single-cup PLACE x 좌표 override (base_link, m). "
+                            "nan(기본)이면 모듈 상수 PLACE_X 사용.",
+            ),
+            DeclareLaunchArgument(
+                "place_y",
+                default_value="nan",
+                description="single-cup PLACE y 좌표 override (base_link, m). "
+                            "nan(기본)이면 모듈 상수 PLACE_Y 사용.",
+            ),
+            DeclareLaunchArgument(
                 "multi_cup",
                 default_value="false",
                 description="한 프레임에 여러 fallen cup 이 있을 때 가까운 순서로 "
@@ -187,13 +207,13 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "sim_cup_x",
-                default_value="0.40",
-                description="sim 모드 가상 컵 base x (m)",
+                default_value="0.28",
+                description="sim 모드 가상 컵 base x (m). 넘어진-컵 작업영역(피라미드 정면 0.45,0 에서 옆·뒤로 빠짐)",
             ),
             DeclareLaunchArgument(
                 "sim_cup_y",
-                default_value="0.0",
-                description="sim 모드 가상 컵 base y (m)",
+                default_value="0.20",
+                description="sim 모드 가상 컵 base y (m). +Y 작업영역",
             ),
             DeclareLaunchArgument(
                 "sim_cup_z",
@@ -221,6 +241,43 @@ def generate_launch_description():
                             "name_space remap으로 바뀌지 않으므로 직접 override 한다. "
                             "dsr_bringup2_moveit(name 기본 '')는 /joint_states(루트)이므로 "
                             "기본 /joint_states. 네임스페이스 bringup이면 :=/<ns>/joint_states.",
+            ),
+            DeclareLaunchArgument(
+                "pyramid_avoid",
+                default_value="true",
+                description="쌓인 피라미드(/stack 점유 슬롯)를 MoveIt collision "
+                            "object 로 등록해 recovery 궤적이 회피. center/degree 는 "
+                            "API polling 으로 동기화. vision 스택/서버 미가용이면 "
+                            "graceful no-op(장애물 0개, 동작 변화 없음). 끄려면 :=false.",
+            ),
+            DeclareLaunchArgument(
+                "pyramid_config_url",
+                default_value="https://yarr-api-31.simplyimg.com/api/robot/config/pyramid",
+                description="GET 으로 center{x,y}+degree 를 받아오는 FastAPI 엔드포인트. "
+                            "verifier 와 동일 소스. 빈 문자열이면 polling 비활성.",
+            ),
+            DeclareLaunchArgument(
+                "pyramid_stack_topic",
+                default_value="/stack",
+                description="피라미드 슬롯 점유 토픽 (std_msgs/String JSON "
+                            "{slot: color|null}). verifier_node 가 publish.",
+            ),
+            DeclareLaunchArgument(
+                "pyramid_sync_poll_period_s",
+                default_value="5.0",
+                description="config(center/degree) API polling 주기(s).",
+            ),
+            DeclareLaunchArgument(
+                "pyramid_obstacle_margin_m",
+                default_value="0.02",
+                description="장애물 박스 xy 인플레이션 여유(m). Pilz 는 회피 재계획을 "
+                            "안 하고 OMPL 만 피하므로 약간의 margin 으로 안전 여유. 기본 2cm.",
+            ),
+            DeclareLaunchArgument(
+                "pyramid_stack_wait_s",
+                default_value="1.5",
+                description="등록 시 /stack 첫 수신을 기다리는 시간(s). sticky 라 "
+                            "vision 이 떠 있으면 즉시 도착. 미수신이면 장애물 스킵.",
             ),
             Node(
                 package="dsr_practice",
@@ -265,6 +322,12 @@ def generate_launch_description():
                         "place_plus_y_cup_tilt_deg": ParameterValue(
                             place_plus_y_cup_tilt_deg, value_type=float
                         ),
+                        "place_x": ParameterValue(
+                            place_x, value_type=float
+                        ),
+                        "place_y": ParameterValue(
+                            place_y, value_type=float
+                        ),
                         "multi_cup": ParameterValue(
                             multi_cup, value_type=bool
                         ),
@@ -297,6 +360,24 @@ def generate_launch_description():
                         # 현재 관절을 읽어 plan/IK 가 된다.
                         "planning_scene_monitor_options.joint_state_topic": (
                             ParameterValue(joint_state_topic, value_type=str)
+                        ),
+                        "pyramid_avoid": ParameterValue(
+                            pyramid_avoid, value_type=bool
+                        ),
+                        "pyramid_config_url": ParameterValue(
+                            pyramid_config_url, value_type=str
+                        ),
+                        "pyramid_stack_topic": ParameterValue(
+                            pyramid_stack_topic, value_type=str
+                        ),
+                        "pyramid_sync_poll_period_s": ParameterValue(
+                            pyramid_sync_poll_period_s, value_type=float
+                        ),
+                        "pyramid_obstacle_margin_m": ParameterValue(
+                            pyramid_obstacle_margin_m, value_type=float
+                        ),
+                        "pyramid_stack_wait_s": ParameterValue(
+                            pyramid_stack_wait_s, value_type=float
                         ),
                     },
                 ],
