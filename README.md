@@ -17,7 +17,11 @@ YOLOv26-seg가 카메라 영상에서 `fallen-cup` / `upright-cup` 두 클래스
 ## Demo Video
 [![Fallen Cup Recovery Demo](https://img.youtube.com/vi/p8Zon8WmvEE/0.jpg)](https://www.youtube.com/watch?v=p8Zon8WmvEE)
 
+**fallen-cup-recovery** — 옆으로 넘어진 컵을 잡고 들어 올린 뒤 손목 회전으로 똑바로 세우기
+
 [![Mouth-Up Cup Recovery Demo](https://img.youtube.com/vi/zjzoMTlykVM/0.jpg)](https://www.youtube.com/watch?v=zjzoMTlykVM)
+
+**mouth-up-cup recovery** — 입구가 위를 향한 컵을 잡아 손목 180° 뒤집어 입구가 아래로 가게 세우기
 
 ## 구성
 
