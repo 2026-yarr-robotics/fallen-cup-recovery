@@ -17,6 +17,8 @@ YOLOv26-seg가 카메라 영상에서 `fallen-cup` / `upright-cup` 두 클래스
 ## Demo Video
 [![Fallen Cup Recovery Demo](https://img.youtube.com/vi/p8Zon8WmvEE/0.jpg)](https://www.youtube.com/watch?v=p8Zon8WmvEE)
 
+[![Mouth-Up Cup Recovery Demo](https://img.youtube.com/vi/zjzoMTlykVM/0.jpg)](https://www.youtube.com/watch?v=zjzoMTlykVM)
+
 ## 구성
 
 두 ROS 2 패키지가 한 쌍으로 동작합니다.
