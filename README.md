@@ -1,4 +1,4 @@
-# fallen-cup-recovery
+# outlier-cup-recovery
 
 Doosan M0609 + RG2 그리퍼 + Intel RealSense 카메라로 **넘어진 컵을 인식하여 잡고 세우는** ROS 2 (Humble) 시스템.
 
