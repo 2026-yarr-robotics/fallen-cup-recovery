@@ -1,6 +1,12 @@
 # outlier-cup-recovery
 
-Doosan M0609 + RG2 그리퍼 + Intel RealSense 카메라로 **넘어진 컵을 인식하여 잡고 세우는** ROS 2 (Humble) 시스템.
+Doosan M0609 + RG2 그리퍼 + Intel RealSense 카메라로 **비정상 자세의 컵을 인식하여 똑바로(mouth-down upright) 세우는** ROS 2 (Humble) 시스템.
+
+두 종류의 outlier(비정상 자세) 컵을 다룹니다.
+- **fallen-cup** — 옆으로 넘어진 컵. 컵 머리 옆을 잡고 들어 올린 뒤 손목 회전으로 세웁니다 (`stand_fallen_cup`).
+- **mouth-up-cup** — 입구가 위를 향한 채 서 있는 컵. 옆을 잡아 들고 손목(joint_6)을 180° 굴려 뒤집은 뒤 입구가 아래로 가게 내려놓습니다 (`place_mouth_up_cup`).
+
+두 스킬은 통합 오케스트레이터 **`outlier_cup_recovery`** 로 묶여, 런치 하나로 fallen 을 먼저 전부 처리하고 이어서 mouth-up 을 처리합니다 ([통합 실행](#통합-실행-outlier_cup_recovery)).
 
 YOLOv26-seg가 카메라 영상에서 `fallen-cup` / `upright-cup` 두 클래스를 분리해 segmentation하고,
 `fallen-cup` mask에서만 yaw 방향벡터를 추출하여 그리퍼가 컵 머리 옆을 잡고 들어 올린 뒤 세웁니다.
@@ -33,6 +39,12 @@ YOLOv26-seg가 카메라 영상에서 `fallen-cup` / `upright-cup` 두 클래스
 - `multi_cup:=true` — 한 프레임에 여러 fallen cup 이 있으면 가까운 순서로 순차 처리
 - `pyramid_avoid:=true` (기본 ON) — 쌓인 컵 피라미드를 MoveIt collision object 로 등록해
   recovery 궤적이 그 영역을 회피. ([아래 참고](#피라미드-영역-회피-place-모드))
+- `place_mouth_up_cup` 노드: `/mouth_up_cup/grasp_pose` (`geometry_msgs/PoseStamped`) 구독 →
+  입구가 위를 향한 컵의 옆을 잡아 들고 손목(joint_6) 180° 굴려 뒤집은 뒤
+  입구가 아래로 가게 내려놓음. ([아래 참고](#mouth-up-컵-뒤집기-place_mouth_up_cup))
+- `outlier_cup_recovery` 노드: 위 두 스킬을 **단일 프로세스·단일 MoveItPy** 로 묶은 통합
+  오케스트레이터. fallen 을 먼저 전부(가까운 순서) 처리하고 이어서 mouth-up 을 처리.
+  ([아래 참고](#통합-실행-outlier_cup_recovery))
 
 ## 외부 의존성 (별도 설치 필요)
 
@@ -95,6 +107,10 @@ ros2 launch dsr_practice stand_fallen_cup.launch.py mode:=drop
 ros2 launch dsr_practice stand_fallen_cup.launch.py \
     mode:=place multi_cup:=true pyramid_avoid:=true \
     pyramid_config_url:=<피라미드 config GET 엔드포인트>
+
+# fallen + mouth-up 통합 (fallen 먼저 전부 → mouth-up). vision 이 /fallen_cup/*,
+# /mouth_up_cup/grasp_pose 를 모두 publish 하고 있어야 함.
+ros2 launch dsr_practice outlier_cup_recovery.launch.py
 ```
 > `pyramid_avoid` / `place_plus_y_auto_swing` 은 기본 ON 이라 생략해도 됩니다.
 > 피라미드 회피는 `/stack` 점유 슬롯 + `pyramid_config_url` 응답이 모두 있을 때만 실제로
@@ -160,6 +176,51 @@ ros2 launch dsr_practice stand_fallen_cup.launch.py \
   - +Y 미감지(다른 컵)면 no-op 이라 항상 켜 둬도 안전. 한 명령으로 ±Y 양쪽 케이스 처리.
 - `place_x` / `place_y` — PLACE 좌표를 리빌드 없이 override(base_link, m). `nan`(기본)이면 모듈 상수 사용.
 
+## mouth-up 컵 뒤집기 (`place_mouth_up_cup`)
+
+입구가 위를 향한 채 서 있는 컵(mouth-up)을 잡아 **입구가 아래로 가는 똑바른 자세
+(mouth-down upright)** 로 뒤집어 작업영역에 내려놓습니다. 입력은
+`/mouth_up_cup/grasp_pose` (`geometry_msgs/PoseStamped`) 하나입니다.
+
+```
+초기화 : controller 연결 대기 → HOME 이동 (Pilz PTP, 실패 시 OMPL) → 그리퍼 open
+Sense  : /mouth_up_cup/grasp_pose 샘플 수집 → base 좌표 grasp point 계산
+Pick & flip & place
+  [1] Approach  컵 옆으로 접근. 같은 쪽(same-side) 우선, 안 풀리면 반대쪽 fallback IK
+  [2] Grab      측면 그립(grip_tilt 로 약간 하향 → 카메라-바닥 클리어) 후 그리퍼 닫음
+  [3] Lift      수직 상승
+  [4] Flip      팔은 정지하고 손목(joint_6)만 180° 굴림 — 입구 위 → 입구 아래
+  [5] Place     PLACE 좌표에 내려놓되 살짝(~5°) 더 세워 안착 성공률↑ → release → retreat
+마무리 : 수직 상승 → HOME 복귀 → 그리퍼 open
+```
+
+- **기하**: mouth-up(축 +Z) → mouth-down upright(축 −Z) 는 순수 joint_6 180° 롤 하나로
+  끝납니다. 팔 자세는 그대로라 fallen 의 손목 pitch 회전보다 단순·안전합니다.
+- **그립 tilt**: `grip_tilt_deg`(기본 15°) 만큼 접근축을 아래로 기울여 낮은 컵을 잡을 때
+  카메라가 바닥에 닿지 않게 합니다. 뒤집은 뒤 잔여 기울기는 place 단계의 보정으로 흡수합니다.
+- **접근 방향**: `approach_side`(`auto`/`left`/`right`). `auto` 는 컵의 base Y 부호로
+  같은 쪽에서 접근하고, IK 가 안 풀리면 반대쪽에서 재시도합니다.
+
+## 통합 실행 (`outlier_cup_recovery`)
+
+fallen-cup recovery 와 mouth-up-cup recovery 를 **하나의 런치**로 묶은 오케스트레이터입니다.
+비싼 자원(MoveItPy, RG2 그리퍼)을 1개만 만들어 두 스킬에 주입하고, 다음 순서로 처리합니다.
+
+1. **fallen 먼저** — `stand_fallen_cup` 의 multi-cup 루프를 강제로 돌려 한 프레임의 fallen
+   컵을 **base_link 최근접 순서**로 전부 처리합니다.
+2. **이어서 mouth-up** — `place_mouth_up_cup` 를 더 이상 mouth-up 컵이 없을 때까지 반복
+   실행합니다(안전 상한 있음).
+
+- 분류는 상류 vision 이 끝냅니다 — fallen 은 `/fallen_cup/*`, mouth-up 은
+  `/mouth_up_cup/grasp_pose` 로 들어오며, 오케스트레이터는 순서만 강제합니다.
+- **종료코드**: `recovered ≥ 1` 또는 `detected == 0`(치울 것 없음) 이면 성공 `0`,
+  감지했는데 하나도 못 세우면 실패 `1`. launch 가 이 코드를 그대로 전파합니다.
+- 두 스킬의 **standalone 동작(개별 런치)은 그대로 유지**됩니다.
+
+```bash
+ros2 launch dsr_practice outlier_cup_recovery.launch.py
+```
+
 ## 실패 보고 & 사전 도달성 검사
 
 ### 종료코드로 실패 전파 (통합)
@@ -203,6 +264,13 @@ ros2 launch dsr_practice stand_fallen_cup.launch.py \
 - `place_x` / `place_y` — PLACE 좌표 override (base_link, m; `nan`이면 모듈 상수)
 - `preflight_reach_check` — `true`(기본)면 집기 전 approach/descend IK 를 미리 검사,
   해가 없으면 그 컵을 skip + `/fallen_cup/unreachable` 통보
+
+`place_mouth_up_cup`
+- `approach_side` — `auto`(기본, 컵 base Y 부호) | `left`(+Y) | `right`(-Y)
+- `grip_tilt_deg` — 측면 그립 하향 기울기(도, 기본 15). 클수록 손목/카메라가 grip 점보다 위로 올라가 낮은 컵에서 카메라-바닥 충돌을 피함
+- `grip_z_offset` — 그립 높이 미세조정(m, 기본 -0.03 = 기하중심보다 3cm 아래)
+- `dry_run` — `true`면 접근 자세까지만 (그리퍼/뒤집기/place 없음)
+- `sim` — HW 없이 MoveIt virtual에서 시뮬레이션
 
 `fallen_cup_pose_node`
 - `target_class_name` — 기본 `fallen-cup`. 빈 문자열이면 클래스 필터링 끔
