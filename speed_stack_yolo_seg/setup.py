@@ -26,6 +26,7 @@ setup(
             "yolo_seg_node = speed_stack_yolo_seg.yolo_seg_node:main",
             "fallen_cup_pose_node = speed_stack_yolo_seg.fallen_cup_pose_node:main",
             "fallen_cup_tracker_node = speed_stack_yolo_seg.fallen_cup_tracker_node:main",
+            "mouth_up_cup_pose_node = speed_stack_yolo_seg.mouth_up_cup_pose_node:main",
         ],
     },
 )

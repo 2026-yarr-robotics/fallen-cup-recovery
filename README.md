@@ -23,14 +23,19 @@ YOLOv26-seg가 카메라 영상에서 `fallen-cup` / `upright-cup` 두 클래스
 
 ### `speed_stack_yolo_seg` (인식 측)
 - `/camera/color/image_raw`, `/camera/aligned_depth_to_color/image_raw` 구독
-- 학습 클래스: `fallen-cup`, `upright-cup`
+- 학습 클래스: `fallen-cup`, `upright-cup`, `mouth-up-cup`
 - [학습 코드 참고](https://github.com/2026-yarr-robotics/vision-YOLO/tree/main/hand-eye-view)
 
-- 출력 토픽
+- **`fallen_cup_pose_node`** — 넘어진 컵 검출
   - `/fallen_cup/pose2d` (`std_msgs/Float32MultiArray`) — top/bottom 픽셀, 방향벡터, yaw, grip 픽셀, conf, 폭
   - `/fallen_cup/grasp_pose` (`geometry_msgs/PoseStamped`, camera optical frame) — 3D grasp point
   - `/fallen_cup/debug_image` (`sensor_msgs/Image`) — 디버그 오버레이
-- 방향벡터는 `target_class_name=fallen-cup` mask에서만 추출 (upright-cup mask는 자동 제외)
+  - 방향벡터는 `target_class_name=fallen-cup` mask에서만 추출 (upright-cup mask는 자동 제외)
+- **`mouth_up_cup_pose_node`** — 입구가 위를 향한 컵 검출 (`mouth-up-cup` 클래스)
+  - `/mouth_up_cup/grasp_pose` (`geometry_msgs/PoseStamped`, camera optical frame) — 컵 윗면(입구) 중심의 3D grasp point (orientation=identity)
+  - `/mouth_up_cup/debug_image` (`sensor_msgs/Image`) — 디버그 오버레이
+  - base_link 변환은 하지 않고 카메라 광학 좌표만 발행 (로봇 노드 `place_mouth_up_cup` 가 자기 EE FK 로 변환) → MoveItPy 불필요, 카메라/depth 만 있으면 동작
+  - 선택 규칙: target 클래스 mask 중 면적이 가장 큰(=가장 가깝/또렷한) 한 개
 
 ### `dsr_practice` (로봇 제어 측)
 - `stand_fallen_cup` 노드: 위 토픽 구독 → MoveIt + RG2로 컵 머리 옆을 잡고 들어 올린 뒤
@@ -96,6 +101,11 @@ ros2 launch speed_stack_yolo_seg fallen_cup_pose.launch.py \
     imgsz:=1280 \
     conf:=0.70 \
     target_class_name:=fallen-cup
+
+# mouth-up 컵 인식 (통합 outlier_cup_recovery 실행 시 함께 띄움)
+ros2 launch speed_stack_yolo_seg mouth_up_cup_pose.launch.py \
+    weights_path:=<path/to/best.pt> \
+    target_class_name:=mouth-up-cup
 ```
 
 **3) 로봇 제어 노드**
