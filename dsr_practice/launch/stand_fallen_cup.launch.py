@@ -66,6 +66,7 @@ def generate_launch_description():
     place_plus_y_cup_tilt_deg = LaunchConfiguration("place_plus_y_cup_tilt_deg")
     place_x = LaunchConfiguration("place_x")
     place_y = LaunchConfiguration("place_y")
+    descend_min_z = LaunchConfiguration("descend_min_z")
     multi_cup = LaunchConfiguration("multi_cup")
     multi_cup_max_iterations = LaunchConfiguration("multi_cup_max_iterations")
     multi_cup_cluster_radius_m = LaunchConfiguration("multi_cup_cluster_radius_m")
@@ -143,6 +144,9 @@ def generate_launch_description():
                 ),
                 "place_y": ParameterValue(
                     place_y, value_type=float
+                ),
+                "descend_min_z": ParameterValue(
+                    descend_min_z, value_type=float
                 ),
                 "multi_cup": ParameterValue(
                     multi_cup, value_type=bool
@@ -321,6 +325,13 @@ def generate_launch_description():
                             "nan(기본)이면 모듈 상수 PLACE_X 사용.",
             ),
             DeclareLaunchArgument(
+                "descend_min_z",
+                default_value="nan",
+                description="grasp 하강 시 flange(link_6) 최저 z(m). 바닥 충돌 방지 하드 "
+                            "플로어. nan(기본)이면 테이블 레벨 grasp 자동. TCP 최저 = "
+                            "이 값 − 0.20(TOOL_LENGTH). 더 보수적이면 키움(예 0.235).",
+            ),
+            DeclareLaunchArgument(
                 "place_y",
                 default_value="nan",
                 description="single-cup PLACE y 좌표 override (base_link, m). "
@@ -362,9 +373,10 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "place_spot_candidates",
-                default_value="0.30:0.10,0.30:0.00,0.30:-0.10",
-                description="빈 안전지점 후보 'x:y,x:y,...' (base_link, 1순위부터). "
-                            "기본 = 검증값 (0.30,0.10) + 좌우 2개.",
+                default_value="0.30:0.20,0.30:0.15,0.30:0.10,0.30:0.05,0.30:0.00,"
+                              "0.30:-0.05,0.30:-0.10,0.30:-0.15,0.30:-0.20",
+                description="빈 안전지점 후보 'x:y,x:y,...' (base_link). single-cup 은 "
+                            "컵 Y 부호와 같은 쪽 가장자리(|y| 큰)부터 검사. ±0.20 까지.",
             ),
             DeclareLaunchArgument(
                 "place_spot_avoid_radius_m",

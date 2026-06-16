@@ -101,8 +101,10 @@ LIFT_HOLD_SEC   = 1.0    # 들어 올린 채 매달림 안정화 대기 시간 (
 HOME_RETURN_HIGH_Z = 0.30  # HOME 복귀 시 EE z 가 이 값보다 높으면 테이블 dip 위험이
                            # 없다고 보고 Pilz PTP(결정적·최단) 를 먼저 시도. retreat 후
                            # (z≈LIFT_Z) 복귀가 이 경로를 타서 OMPL 의 빙 도는 궤적을 회피.
-RETREAT_LIFT_STEP_M = 0.06 # place 후 수직 상승 LIN 의 step 크기 (m). 짧을수록 특이점을
+RETREAT_LIFT_STEP_M = 0.08 # 수직 상승 LIN 의 step 크기 (m). 단일 LIN 실패 시 fallback
+                           # 으로 z 를 이 단위로 나눠 계단식 상승. 짧을수록 특이점을
                            # 가로지를 확률↓(LIN 성공률↑) 이지만 step 수↑(느려짐).
+                           # 0.08m 단위(0.15 에서 줄임).
 HOME_PREREVERSE_MIN_Z = 0.25  # joint_1 pre-reverse(수평 호) 를 허용하는 최소 EE z.
                            # 이보다 낮으면 joint_1 회전이 테이블을 쓸어버리므로,
                            # 먼저 수직 상승을 시도하고 그래도 낮으면 pre-reverse 를 스킵.
@@ -316,6 +318,13 @@ class StandFallenCupNode(Node):
         #   리빌드 없이 작업영역 안에서 세울 위치를 튜닝하기 위함 (NaN 이면 상수 사용).
         self.declare_parameter("place_x", float("nan"))
         self.declare_parameter("place_y", float("nan"))
+        # descend_min_z: grasp 하강 시 link_6(flange) 가 내려갈 수 있는 절대 최저 z(m,
+        #   base frame). 그리퍼 끝(TCP)은 이 값 − TOOL_LENGTH_M(0.20) 위치. depth 가
+        #   실제보다 깊게 잡히거나 컵 z 가 음수로 튀어도 이 값 아래로는 절대 안 내려가
+        #   바닥을 박지 않는다. NaN(기본) 이면 컵이 테이블(TABLE_Z)에 있을 때의 grip
+        #   flange z = 테이블 레벨 grasp 를 자동 사용. 더 보수적으로(바닥에서 더 멀게)
+        #   두려면 값을 키운다(예: 0.235).
+        self.declare_parameter("descend_min_z", float("nan"))
         # multi_cup:
         #   true 면 한 프레임에 여러 넘어진 cup 이 있어도 모두 순차 처리.
         #   /fallen_cup/cups_pose2d, /fallen_cup/cups_grasp_poses (Phase 1) 토픽 사용.
@@ -326,17 +335,23 @@ class StandFallenCupNode(Node):
         self.declare_parameter("multi_cup_max_iterations", 10)
         self.declare_parameter("multi_cup_cluster_radius_m", 0.04)
         self.declare_parameter("multi_cup_blacklist_radius_m", 0.06)
-        self.declare_parameter("multi_cup_min_samples_per_cluster", 3)
+        self.declare_parameter("multi_cup_min_samples_per_cluster", 5)
         # ── 빈 안전지점 세우기 (multi_cup 기본) ────────────────────────────
         #   multi_cup 동작을 "제자리 세우기"가 아니라 "작업영역 빈 안전지점 세우기"로.
         #   카메라가 보는 정상 컵(/hand_eye/boxes upright-cup) + 이미 세운 컵(blacklist)
         #   + 피라미드를 피해 후보 좌표 중 첫 빈 자리에 세운다. 빈 자리 없으면 그 cup skip.
         #   place_in_place:=true 면 기존 제자리 세우기로 회귀.
         self.declare_parameter("place_in_place", False)
-        #   후보 PLACE 좌표 "x:y,x:y,..." (base_link, 1순위부터 검사). 기본 = 검증값
-        #   (0.30,0.10) + 좌우 2개. 셋 다 +Y/-Y swing flange 가 ±SAFE_Y_MAX(0.30) 내.
+        #   후보 PLACE 좌표 "x:y,x:y,..." (base_link). single-cup 은 컵의 Y 부호와
+        #   같은 쪽 후보를 |y| 큰(작업영역 가장자리) 순으로 먼저 검사한다. 가장자리
+        #   ±0.20 부터 안쪽으로 0.00 까지 0.05 간격으로 두어, 가장자리가 점유돼도
+        #   같은 쪽 빈자리를 찾는다. (모두 점유면 반대쪽 폴백 → 그래도 없으면 PLACE_X/Y.)
+        #   ±0.20 은 실로봇에서 도달 확인됨(flange 는 IK 도달성으로 결정, SAFE_Y_MAX
+        #   소프트클램프는 place flange 에 미적용). 더 멀리 두려면 이 값을 늘리면 됨.
         self.declare_parameter(
-            "place_spot_candidates", "0.30:0.10,0.30:0.00,0.30:-0.10")
+            "place_spot_candidates",
+            "0.30:0.20,0.30:0.15,0.30:0.10,0.30:0.05,0.30:0.00,"
+            "0.30:-0.05,0.30:-0.10,0.30:-0.15,0.30:-0.20")
         #   후보를 "점유"로 볼 회피 반경(m) — upright-cup/blacklist/피라미드 공통.
         self.declare_parameter("place_spot_avoid_radius_m", 0.09)
         #   정상 컵 위치 토픽 (upright_cup_pose_node 발행, base_link MarkerArray).
@@ -455,6 +470,18 @@ class StandFallenCupNode(Node):
         self.place_in_place = bool(self.get_parameter("place_in_place").value)
         self.place_spot_avoid_radius_m = float(
             self.get_parameter("place_spot_avoid_radius_m").value
+        )
+        _dmz = float(self.get_parameter("descend_min_z").value)
+        # 자동 기본값 = 컵이 테이블(TABLE_Z)에 있을 때의 descend flange z
+        #   = flange_at_grip(table) + GRIP_Z_MARGIN. 즉 정상 테이블 grasp 깊이와 동일.
+        #   그보다 깊게는 절대 안 내려가 바닥을 박지 않는다(컵은 테이블보다 낮을 수 없음).
+        self.descend_min_z = (
+            (TABLE_Z - CUP_R_AT_GRIP + TOOL_LENGTH_M + GRIP_Z_MARGIN)
+            if math.isnan(_dmz) else _dmz
+        )
+        self.get_logger().info(
+            f"[grasp] descend 바닥 플로어 descend_min_z={self.descend_min_z:.3f}m "
+            f"(flange) → TCP 최저≈{self.descend_min_z - TOOL_LENGTH_M:.3f}m"
         )
         self.upright_boxes_topic = str(
             self.get_parameter("upright_boxes_topic").value
@@ -926,13 +953,30 @@ class StandFallenCupNode(Node):
                     (float(m.pose.position.x), float(m.pose.position.y)))
         self._upright_cups = cups
 
-    def _select_safe_place_spot(self, blacklist):
-        """후보 PLACE 좌표 중 정상 컵/이미 세운 컵/피라미드를 모두 피한 첫 빈 자리.
-        없으면 None. 회피 반경 = place_spot_avoid_radius_m."""
+    def _select_safe_place_spot(self, blacklist, prefer_y_sign=None,
+                                extra_occupied=None):
+        """후보 PLACE 좌표 중 정상 컵/이미 세운 컵/넘어진 컵/피라미드를 모두 피한
+        첫 빈 자리. 없으면 None. 회피 반경 = place_spot_avoid_radius_m.
+
+        prefer_y_sign(+1/-1)이 주어지면 같은 Y 부호 후보를 작업영역 가장자리(|y|가
+        큰) 순으로 먼저 검사하고, 그쪽이 전부 막히면 반대쪽으로 폴백한다(없을 때만).
+        extra_occupied: 추가로 피할 (x,y) 목록 — single-cup 에서 넘어진 컵 스냅샷 전달.
+        """
         log = self.get_logger()
         r = self.place_spot_avoid_radius_m
         uprights = list(self._upright_cups)
-        for (sx, sy) in self.place_spot_candidates:
+        fallen = list(extra_occupied) if extra_occupied else []
+
+        cands = list(self.place_spot_candidates)
+        if prefer_y_sign is not None:
+            same_side = +1 if prefer_y_sign >= 0 else -1
+            def _key(c):
+                # 같은 부호 먼저(0=같은쪽 우선), 그 안에서 가장자리(|y| 큰) 우선.
+                opp = 0 if ((c[1] >= 0) == (same_side >= 0)) else 1
+                return (opp, -abs(c[1]))
+            cands = sorted(cands, key=_key)
+
+        for (sx, sy) in cands:
             hit_up = next(
                 ((ux, uy) for (ux, uy) in uprights
                  if math.hypot(sx - ux, sy - uy) < r), None)
@@ -940,6 +984,14 @@ class StandFallenCupNode(Node):
                 log.info(
                     f"[spot] 후보 ({sx:.3f},{sy:.3f}) 스킵 — 정상 컵 "
                     f"({hit_up[0]:.3f},{hit_up[1]:.3f}) 근접")
+                continue
+            hit_fa = next(
+                ((fx, fy) for (fx, fy) in fallen
+                 if math.hypot(sx - fx, sy - fy) < r), None)
+            if hit_fa is not None:
+                log.info(
+                    f"[spot] 후보 ({sx:.3f},{sy:.3f}) 스킵 — 넘어진 컵 "
+                    f"({hit_fa[0]:.3f},{hit_fa[1]:.3f}) 근접")
                 continue
             hit_bl = next(
                 ((bx, by) for (bx, by) in blacklist
@@ -955,14 +1007,36 @@ class StandFallenCupNode(Node):
                     log.info(
                         f"[spot] 후보 ({sx:.3f},{sy:.3f}) 스킵 — 피라미드 근접")
                     continue
+            if prefer_y_sign is not None and ((sy >= 0) != (prefer_y_sign >= 0)):
+                log.warn(
+                    f"[spot] 같은 Y측 빈자리 없음 → 반대쪽 ({sx:.3f},{sy:.3f}) 폴백")
             log.info(
                 f"[spot] 빈 안전지점 선택 → ({sx:.3f},{sy:.3f}) "
-                f"(정상 컵 {len(uprights)}개·기점유 {len(blacklist)}개 회피)")
+                f"(정상 {len(uprights)}·넘어진 {len(fallen)}·기점유 "
+                f"{len(blacklist)}개 회피)")
             return (sx, sy)
         log.warn(
             f"[spot] 빈 안전지점 없음 — 후보 {len(self.place_spot_candidates)}개 "
             f"모두 점유/근접")
         return None
+
+    def _snapshot_fallen_cups_base(self, exclude_xy=None, exclude_r=0.06):
+        """최신 카메라 프레임의 넘어진 컵들을 base_link XY 로 변환해 반환(list of
+        (x,y)). exclude_xy 근방(exclude_r m)은 제외 — 지금 집을 대상 컵 자신은
+        장애물로 보지 않는다. cups 토픽이 안 들어왔으면 []."""
+        frames = list(self._cups_frame_samples)
+        if not frames:
+            return []
+        T_base_cam = get_ee_matrix(self.robot) @ self.gripper2cam
+        out = []
+        for c in frames[-1].get("cups", []):
+            p = T_base_cam @ np.append(c["p_cam"], 1.0)
+            x, y = float(p[0]), float(p[1])
+            if exclude_xy is not None and math.hypot(
+                    x - exclude_xy[0], y - exclude_xy[1]) < exclude_r:
+                continue
+            out.append((x, y))
+        return out
 
     def _sense_multi_targets(self, blacklist):
         """SAMPLE_COLLECT_SEC 동안 cup frame sample 수집 → 클러스터링 → base 변환
@@ -1525,8 +1599,18 @@ class StandFallenCupNode(Node):
                     f"{self._active_place_y:.3f}) (in-place stand)"
                 )
             else:
-                # 기본: 작업영역 빈 안전지점에 세우기 (정상 컵/기점유/피라미드 회피)
-                spot = self._select_safe_place_spot(placed)
+                # 기본: 컵과 같은 Y 측 작업영역 가장자리 빈 안전지점에 세우기.
+                # 정상 컵/이미 세운 컵/남은 다른 넘어진 컵/피라미드를 모두 회피
+                # (single-cup 과 동일 로직). 남은 넘어진 컵 = 이번 프레임 후보 중 현재
+                # 대상(candidates[0])을 제외한 나머지 base XY.
+                cup_y_sign = +1 if float(p_base[1]) >= 0.0 else -1
+                other_fallen = [
+                    (float(c["p_base"][0]), float(c["p_base"][1]))
+                    for c in candidates[1:]
+                ]
+                spot = self._select_safe_place_spot(
+                    placed, prefer_y_sign=cup_y_sign,
+                    extra_occupied=other_fallen)
                 if spot is None:
                     log.warn(
                         "[multi-cup] 빈 안전지점 없음 — 이 cup skip "
@@ -1536,7 +1620,10 @@ class StandFallenCupNode(Node):
                 self._active_place_x, self._active_place_y = spot
                 log.info(
                     f"[multi-cup] PLACE = ({self._active_place_x:.3f}, "
-                    f"{self._active_place_y:.3f}) (safe-spot stand)"
+                    f"{self._active_place_y:+.3f}) "
+                    f"(컵 Y={float(p_base[1]):+.3f} → "
+                    f"{'+Y' if cup_y_sign > 0 else '-Y'}측, "
+                    f"정상 {len(self._upright_cups)}·남은넘어진 {len(other_fallen)}개 회피)"
                 )
 
             # cup_yaw override 가 set 되어 있으면 그대로 적용 (테스트 용도).
@@ -1579,8 +1666,8 @@ class StandFallenCupNode(Node):
         flange_at_grip = bz - CUP_R_AT_GRIP + TOOL_LENGTH_M
         approach_z = flange_at_grip + APPROACH_OFFSET
         descend_z = flange_at_grip + GRIP_Z_MARGIN
-        if descend_z < SAFE_Z_MIN:
-            descend_z = SAFE_Z_MIN
+        # 바닥 충돌 방지 하드 플로어 (실제 실행과 동일하게 preflight 도 적용).
+        descend_z = max(descend_z, SAFE_Z_MIN, self.descend_min_z)
 
         approach_state = self.ik_state_with_current_seed(
             make_pose(bx, by, approach_z, ori)
@@ -1666,9 +1753,16 @@ class StandFallenCupNode(Node):
 
         # 5) DESCEND — IK를 현재 관절 seed로 잠가서 wrist 회전 차단
         descend_z = flange_at_grip + GRIP_Z_MARGIN
-        if descend_z < SAFE_Z_MIN:
-            log.warn(f"descend_z={descend_z:.3f} → {SAFE_Z_MIN} (clamp)")
-            descend_z = SAFE_Z_MIN
+        # 바닥 충돌 방지: flange 가 descend_min_z(기본=테이블 레벨 grasp) 아래로는
+        # 절대 안 내려가게 하드 클램프. depth 가 과하게 깊게 잡혀도 바닥을 안 박는다.
+        floor_z = max(SAFE_Z_MIN, self.descend_min_z)
+        if descend_z < floor_z:
+            log.warn(
+                f"descend_z={descend_z:.3f} < floor {floor_z:.3f} → clamp "
+                f"(바닥 충돌 방지, TCP≈{floor_z - TOOL_LENGTH_M:.3f}m). "
+                f"depth 가 과하게 깊었을 수 있음 — 컵을 놓칠 수 있으니 확인."
+            )
+            descend_z = floor_z
         descend_pose = make_pose(bx, by, descend_z, ori)
         descend_state = self.ik_state_with_current_seed(descend_pose)
         if descend_state is None:
@@ -1750,34 +1844,29 @@ class StandFallenCupNode(Node):
             #   미감지 시 사용자가 명시한(또는 기본) 파라미터 그대로 사용.
             if self.place_plus_y_auto_swing:
                 sin_cup = math.sin(cup_yaw)
-                if sin_cup > PLUS_Y_DETECT_SIN_THRESHOLD:
+                # swing(elbow 회피) 방향은 실제 PLACE 측(self._active_place_y 부호)을
+                # 따른다. 스마트 PLACE 는 컵 '위치' 측을 고르는데, swing 을 컵이 '누운
+                # 방향'(cup_yaw) 부호로 정하면 둘이 어긋날 때(예: -Y 위치 컵이 +Y 로
+                # 누움) joint_1 을 PLACE 반대편으로 swing 시켜 standing IK 가 안 풀리고
+                # 노드가 죽는다(실측). 트리거는 기존대로 컵이 한쪽으로 누웠을 때만.
+                if abs(sin_cup) > PLUS_Y_DETECT_SIN_THRESHOLD:
+                    place_left = self._active_place_y >= 0.0
+                    if place_left:
+                        side = self.place_plus_y_side
+                        base_yaw = self.place_plus_y_base_yaw_deg
+                    else:
+                        side = ("right" if self.place_plus_y_side == "left"
+                                else "left")
+                        base_yaw = -self.place_plus_y_base_yaw_deg
                     log.info(
                         f"[plus-y-auto] cup_yaw={math.degrees(cup_yaw):+.1f}° "
-                        f"(sin={sin_cup:.3f}) > thr={PLUS_Y_DETECT_SIN_THRESHOLD} → "
-                        "swing strategy 발동: "
-                        f"side={self.place_plus_y_side}, "
-                        f"base_yaw={self.place_plus_y_base_yaw_deg:+.1f}°, "
+                        f"(sin={sin_cup:.3f}), PLACE_y={self._active_place_y:+.3f} → "
+                        f"{'+Y' if place_left else '-Y'}측 swing: "
+                        f"side={side}, base_yaw={base_yaw:+.1f}°, "
                         f"tilt={self.place_plus_y_cup_tilt_deg:+.1f}°"
                     )
-                    self.place_flange_side = self.place_plus_y_side
-                    self.place_base_yaw_deg = self.place_plus_y_base_yaw_deg
-                    self.place_cup_tilt_deg = self.place_plus_y_cup_tilt_deg
-                elif sin_cup < -PLUS_Y_DETECT_SIN_THRESHOLD:
-                    # cup wide 가 -Y 로 누운 대칭 케이스: 위 +Y swing 을 좌우 반전.
-                    #   side left↔right, base_yaw 부호 반전(+60→-60), tilt 동일.
-                    # joint_1 을 -Y 쪽으로 swing 시켜 elbow 가 피라미드를 쓸지 않게 한다
-                    #   (반전 없으면 default config 로 접근해 link_4/5 가 피라미드 통과).
-                    mirror_side = "right" if self.place_plus_y_side == "left" else "left"
-                    mirror_base_yaw = -self.place_plus_y_base_yaw_deg
-                    log.info(
-                        f"[plus-y-auto] cup_yaw={math.degrees(cup_yaw):+.1f}° "
-                        f"(sin={sin_cup:.3f}) < -thr={-PLUS_Y_DETECT_SIN_THRESHOLD} → "
-                        "-Y 대칭 swing 발동: "
-                        f"side={mirror_side}, base_yaw={mirror_base_yaw:+.1f}°, "
-                        f"tilt={self.place_plus_y_cup_tilt_deg:+.1f}°"
-                    )
-                    self.place_flange_side = mirror_side
-                    self.place_base_yaw_deg = mirror_base_yaw
+                    self.place_flange_side = side
+                    self.place_base_yaw_deg = base_yaw
                     self.place_cup_tilt_deg = self.place_plus_y_cup_tilt_deg
                 else:
                     log.info(
@@ -2506,11 +2595,37 @@ class StandFallenCupNode(Node):
         # sense 동안 갱신된 정상 컵을 collision object 로 등록 (궤적 회피).
         self._register_upright_obstacles()
 
-        # single-cup mode: 기본 PLACE 좌표(또는 place_x/y override) 사용
+        # single-cup mode: PLACE 좌표 선택.
+        #   - place_x/y 를 명시 override 하면 그대로 사용(수동 우선).
+        #   - 아니면 컵과 같은 Y 측 작업영역 가장자리 빈자리를 자동 선택해, 이미
+        #     작업영역에 있는 정상 컵/넘어진 컵/피라미드를 모두 피한다(부딪힘 방지).
         _px = self.get_parameter("place_x").value
         _py = self.get_parameter("place_y").value
-        self._active_place_x = PLACE_X if math.isnan(_px) else float(_px)
-        self._active_place_y = PLACE_Y if math.isnan(_py) else float(_py)
+        if not math.isnan(_px) or not math.isnan(_py):
+            self._active_place_x = PLACE_X if math.isnan(_px) else float(_px)
+            self._active_place_y = PLACE_Y if math.isnan(_py) else float(_py)
+            log.info(
+                f"[spot] place_x/y override → "
+                f"({self._active_place_x:.3f},{self._active_place_y:+.3f})")
+        else:
+            cup_y_sign = +1 if float(p_base[1]) >= 0.0 else -1
+            other_fallen = self._snapshot_fallen_cups_base(
+                exclude_xy=(float(p_base[0]), float(p_base[1])))
+            spot = self._select_safe_place_spot(
+                [], prefer_y_sign=cup_y_sign, extra_occupied=other_fallen)
+            if spot is not None:
+                self._active_place_x, self._active_place_y = spot
+            else:
+                self._active_place_x, self._active_place_y = PLACE_X, PLACE_Y
+                log.warn(
+                    f"[spot] 빈자리 못 찾음 → 기본 PLACE "
+                    f"({PLACE_X:.3f},{PLACE_Y:+.3f}) 사용")
+            log.info(
+                f"[spot] single-cup PLACE = "
+                f"({self._active_place_x:.3f},{self._active_place_y:+.3f}) "
+                f"(컵 Y={float(p_base[1]):+.3f} → "
+                f"{'+Y' if cup_y_sign > 0 else '-Y'}측, "
+                f"정상 {len(self._upright_cups)}개·넘어진 {len(other_fallen)}개 회피)")
         if not self._pick_and_handle_cup(p_base, cup_yaw):
             return False
 

@@ -225,7 +225,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "multi_cup_blacklist_radius_m", default_value="0.06"),
         DeclareLaunchArgument(
-            "multi_cup_min_samples_per_cluster", default_value="3"),
+            "multi_cup_min_samples_per_cluster", default_value="5"),
         DeclareLaunchArgument("place_in_place", default_value="false"),
         DeclareLaunchArgument(
             "place_spot_candidates",

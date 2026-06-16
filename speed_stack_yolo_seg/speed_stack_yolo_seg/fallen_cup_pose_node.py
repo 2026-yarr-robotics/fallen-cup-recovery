@@ -175,6 +175,14 @@ class FallenCupPoseNode(Node):
         self.declare_parameter("expected_axis_length_m", 0.075)
         self.declare_parameter("axis_length_tol_m", 0.02)
 
+        # 마스크 기반 depth fallback: grip/축끝 픽셀의 작은 창(window)에서 depth 가
+        # 비면(광택 컵 IR 드롭아웃·근접·림/구멍), 컵 마스크 안 유효 depth 들의
+        # percentile 로 대체한다. 표면에 구멍이 있어도 마스크 어디든 깊이가 있으면
+        # 3D grasp 좌표가 만들어진다. (정상컵 노드 depth_mask_fallback 과 동일 개념)
+        self.declare_parameter("depth_mask_fallback", True)
+        self.declare_parameter("depth_mask_radius_px", 45.0)
+        self.declare_parameter("depth_mask_percentile", 50.0)
+
         self.weights_path = str(self.get_parameter("weights_path").value)
         self.image_topic = str(self.get_parameter("image_topic").value)
         self.depth_topic = str(self.get_parameter("depth_topic").value)
@@ -216,6 +224,15 @@ class FallenCupPoseNode(Node):
         )
         self.axis_length_tol_m = float(
             self.get_parameter("axis_length_tol_m").value
+        )
+        self.depth_mask_fallback = as_bool(
+            self.get_parameter("depth_mask_fallback").value
+        )
+        self.depth_mask_radius_px = float(
+            self.get_parameter("depth_mask_radius_px").value
+        )
+        self.depth_mask_percentile = float(
+            self.get_parameter("depth_mask_percentile").value
         )
 
         if self.weights_path == "":
@@ -346,6 +363,42 @@ class FallenCupPoseNode(Node):
 
         return float(np.median(valid))
 
+    def _depth_from_mask(self, mask, u, v):
+        """컵 마스크 안의 유효 depth percentile (m). (u,v) 반경 내로 한정.
+        depth/마스크 없거나 유효 픽셀 0 이면 None."""
+        if self.last_depth_m is None or mask is None:
+            return None
+        depth = self.last_depth_m
+        if mask.shape[:2] != depth.shape[:2]:
+            return None
+        valid_mask = mask > 0
+        if self.depth_mask_radius_px > 0:
+            ys, xs = np.nonzero(valid_mask)
+            if xs.size:
+                d2 = ((xs.astype(np.float32) - float(u)) ** 2
+                      + (ys.astype(np.float32) - float(v)) ** 2)
+                local = d2 <= self.depth_mask_radius_px ** 2
+                if np.any(local):
+                    lm = np.zeros_like(valid_mask, dtype=bool)
+                    lm[ys[local], xs[local]] = True
+                    valid_mask = lm
+        vals = depth[valid_mask]
+        vals = vals[np.isfinite(vals)]
+        vals = vals[vals > 0.05]
+        if vals.size == 0:
+            return None
+        pct = min(100.0, max(0.0, self.depth_mask_percentile))
+        return float(np.percentile(vals, pct))
+
+    def get_depth_for_mask(self, mask, u, v, window=7):
+        """grip/축끝 픽셀 창 우선, 비면 마스크 영역 depth 로 fallback."""
+        z = self.get_depth_at_pixel(u, v, window=window)
+        if z is not None:
+            return z
+        if self.depth_mask_fallback:
+            return self._depth_from_mask(mask, u, v)
+        return None
+
     def deproject_pixel_to_3d(self, u, v, z):
         if self.fx is None or self.fy is None or self.cx is None or self.cy is None:
             return None
@@ -355,17 +408,19 @@ class FallenCupPoseNode(Node):
 
         return x, y, z
 
-    def compute_axis_length_m(self, top_center, bottom_center):
+    def compute_axis_length_m(self, top_center, bottom_center, mask=None):
         """top→bottom 축의 실제 길이(m). depth/intrinsics 없으면 None.
 
         축 양 끝 픽셀을 각자의 depth로 3D(camera optical frame) deproject 한 뒤
         유클리드 거리를 잰다. 미터 단위라 카메라-컵 거리가 변해도 일정하고,
         두 컵을 잇는 잘못된 축은 정상 대비 크게 길어져 쉽게 구분된다.
+        mask 가 주어지면 끝점 depth 가 빌 때 마스크(컵 표면) depth 로 보완해
+        끝점이 림/엣지라 뒤쪽 테이블 depth 를 읽어 축이 부풀던 문제를 줄인다.
         """
         if not self.use_depth or self.fx is None or self.fy is None:
             return None
-        z_t = self.get_depth_at_pixel(top_center[0], top_center[1], window=7)
-        z_b = self.get_depth_at_pixel(bottom_center[0], bottom_center[1], window=7)
+        z_t = self.get_depth_for_mask(mask, top_center[0], top_center[1], window=7)
+        z_b = self.get_depth_for_mask(mask, bottom_center[0], bottom_center[1], window=7)
         if z_t is None or z_b is None:
             return None
         p_t = self.deproject_pixel_to_3d(top_center[0], top_center[1], z_t)
@@ -546,6 +601,15 @@ class FallenCupPoseNode(Node):
 
         grip_point = top_center + direction * offset_px
 
+        # 두 face 마스크 결합(컵 전체) — depth fallback 에 사용.
+        two_mask = None
+        if top.get("mask") is not None and bottom.get("mask") is not None:
+            two_mask = np.maximum(top["mask"], bottom["mask"])
+        elif top.get("mask") is not None:
+            two_mask = top["mask"]
+        elif bottom.get("mask") is not None:
+            two_mask = bottom["mask"]
+
         return {
             "method": "two_face",
             "top_center": top_center,
@@ -556,7 +620,9 @@ class FallenCupPoseNode(Node):
             "top_width_px": top_width_px,
             "bottom_width_px": bottom_width_px,
             "confidence": 0.5 * (top["conf"] + bottom["conf"]),
-            "axis_length_m": self.compute_axis_length_m(top_center, bottom_center),
+            "mask": two_mask,
+            "axis_length_m": self.compute_axis_length_m(
+                top_center, bottom_center, two_mask),
             "axis_length_px": float(norm),
         }
 
@@ -756,7 +822,9 @@ class FallenCupPoseNode(Node):
             "top_width_px": float(top_width_px),
             "bottom_width_px": float(bottom_width_px),
             "confidence": float(detection["conf"]),
-            "axis_length_m": self.compute_axis_length_m(top_center, bottom_center),
+            "mask": detection.get("mask"),
+            "axis_length_m": self.compute_axis_length_m(
+                top_center, bottom_center, detection.get("mask")),
             "axis_length_px": float(axis_norm),
         }
 
@@ -978,7 +1046,7 @@ class FallenCupPoseNode(Node):
         nan = float("nan")
         for est in estimates:
             grip = est["grip_point"]
-            z = self.get_depth_at_pixel(grip[0], grip[1], window=7)
+            z = self.get_depth_for_mask(est.get("mask"), grip[0], grip[1], window=7)
             pose = Pose()
             if z is None:
                 # depth 없는 cup: NaN 으로 표시. consumer 는 isnan 체크로 필터.
@@ -1014,7 +1082,7 @@ class FallenCupPoseNode(Node):
             return
 
         grip = estimate["grip_point"]
-        z = self.get_depth_at_pixel(grip[0], grip[1], window=7)
+        z = self.get_depth_for_mask(estimate.get("mask"), grip[0], grip[1], window=7)
 
         if z is None:
             return
